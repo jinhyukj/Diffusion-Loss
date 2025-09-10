@@ -1,0 +1,35 @@
+# Python junk
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs & temp
+*.log
+*.tmp
+
+# WandB & outputs
+wandb/
+output/
+
+# Big model artifacts (use Git LFS instead)
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+
+# Egg/info build dirs
+*.egg-info/
+build/
+dist/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Keep metadata CSVs in model_training, ignore CSVs elsewhere by default
+*.csv
+!examples/wanvideo/model_training/metadata*.csv
+!examples/wanvideo/model_training/test.csv
+EOF
