@@ -1,4 +1,8 @@
 import imageio, os, torch, warnings, torchvision, argparse, json
+try:
+    import wandb  # optional
+except Exception:
+    wandb = None
 from ..utils import ModelConfig
 from ..models.utils import load_state_dict
 from peft import LoraConfig, inject_adapter_in_model
@@ -546,6 +550,25 @@ def launch_training_task(
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+
+    # Initialize Weights & Biases (main process only)
+    use_wandb = False
+    if args is not None and getattr(args, "use_wandb", False) and accelerator.is_main_process and (wandb is not None):
+        use_wandb = True
+        tags = None if args.wandb_tags is None else [t for t in args.wandb_tags.split(",") if t]
+        try:
+            wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run_name, tags=tags,
+                       config={
+                           "learning_rate": learning_rate,
+                           "weight_decay": weight_decay,
+                           "num_epochs": num_epochs,
+                           "gradient_accumulation_steps": gradient_accumulation_steps,
+                           "dataset_num_workers": num_workers,
+                       })
+            wandb.watch(accelerator.unwrap_model(model), log="gradients", log_freq=max(1, args.wandb_log_every))
+        except Exception as e:
+            print(f"W&B init failed: {e}")
+            use_wandb = False
     
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
@@ -559,9 +582,52 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                # W&B scalar logging
+                if use_wandb and (model_logger.num_steps % args.wandb_log_every == 0):
+                    try:
+                        # Optional audio stats for visibility into conditioning branch
+                        audio_stats = {}
+                        try:
+                            m = accelerator.unwrap_model(model)
+                            dit = getattr(m.pipe, "dit", None)
+                            if dit is not None:
+                                # audio_proj
+                                if hasattr(dit, "audio_proj") and hasattr(dit.audio_proj, "proj"):
+                                    w = dit.audio_proj.proj.weight
+                                    audio_stats["audio_proj/grad_norm"] = float(w.grad.norm().item()) if w.grad is not None else 0.0
+                                    audio_stats["audio_proj/weight_abs_mean"] = float(w.detach().abs().mean().item())
+                                # audio_cond heads
+                                if hasattr(dit, "audio_cond_projs") and dit.audio_cond_projs is not None:
+                                    cond_grads, cond_abs = [], []
+                                    for lin in dit.audio_cond_projs:
+                                        g = lin.weight.grad
+                                        cond_grads.append(float(g.norm().item()) if g is not None else 0.0)
+                                        cond_abs.append(float(lin.weight.detach().abs().mean().item()))
+                                    if len(cond_grads) > 0:
+                                        audio_stats["audio_cond/grad_norm_mean"] = float(sum(cond_grads) / len(cond_grads))
+                                        audio_stats["audio_cond/grad_norm_max"] = float(max(cond_grads))
+                                    if len(cond_abs) > 0:
+                                        audio_stats["audio_cond/weight_abs_mean_mean"] = float(sum(cond_abs) / len(cond_abs))
+                        except Exception:
+                            pass
+
+                        wandb.log({
+                            "train/loss": float(loss.item()),
+                            "train/lr": float(optimizer.param_groups[0]["lr"]),
+                            "train/step": model_logger.num_steps,
+                            "train/accum_steps": gradient_accumulation_steps,
+                            **audio_stats,
+                        }, step=model_logger.num_steps)
+                    except Exception as e:
+                        print(f"W&B log failed at step {model_logger.num_steps}: {e}")
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
+    if use_wandb:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 def launch_data_process_task(
@@ -619,6 +685,18 @@ def wan_parser():
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+    # Self-Forcing discrete timestep support
+    parser.add_argument("--sf_restrict_timesteps", default=False, action="store_true", help="Restrict training timesteps to a warped denoising_step_list like Self-Forcing.")
+    parser.add_argument("--sf_denoising_step_list", type=str, default="1000,750,500,250", help="Comma-separated denoising steps (e.g., 1000,750,500,250).")
+    parser.add_argument("--sf_warp_denoising_step", default=True, action="store_true", help="Apply Self-Forcing warp: use scheduler.timesteps[1000 - step].")
+    parser.add_argument("--sf_timestep_shift", type=float, default=5.0, help="Scheduler shift used to compute timesteps (should match Self-Forcing config).")
+        # Weights & Biases (optional)
+    parser.add_argument("--use_wandb", default=False, action="store_true", help="Enable Weights & Biases logging (main process only).")
+    parser.add_argument("--wandb_project", type=str, default="DiffSynth", help="W&B project name.")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="W&B entity (team) name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="W&B run name.")
+    parser.add_argument("--wandb_tags", type=str, default=None, help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb_log_every", type=int, default=10, help="Log every N steps.")
     return parser
 
 
@@ -652,6 +730,7 @@ def flux_parser():
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+
     return parser
 
 

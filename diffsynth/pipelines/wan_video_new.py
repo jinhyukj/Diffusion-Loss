@@ -13,6 +13,7 @@ from typing import Optional
 from typing_extensions import Literal
 
 from ..utils import BasePipeline, ModelConfig, PipelineUnit, PipelineUnitRunner
+from ..models.audio_pack import AudioPack
 from ..models import ModelManager, load_state_dict
 from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
 from ..models.wan_video_dit_s2v import rope_precompute
@@ -80,13 +81,31 @@ class WanVideoPipeline(BasePipeline):
     def training_loss(self, **inputs):
         max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * self.scheduler.num_train_timesteps)
         min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
-        timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
-        timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
+        # If restricted to Self-Forcing-style discrete timesteps, choose one of them
+        if hasattr(self, "sf_allowed_timestep_indices") and self.sf_allowed_timestep_indices is not None and len(self.sf_allowed_timestep_indices) > 0:
+            idx = self.sf_allowed_timestep_indices[torch.randint(0, len(self.sf_allowed_timestep_indices), (1,))]
+            timestep = self.scheduler.timesteps[idx].to(dtype=self.torch_dtype, device=self.device)
+        else:
+            timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+            timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
         
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
         
-        noise_pred = self.model_fn(**inputs, timestep=timestep)
+        # Route to OmniAvatar-style audio path if explicit audio embeddings are provided.
+        if inputs.get("audio_emb", None) is not None:
+            noise_pred = model_fn_audio(
+                dit=self.dit,
+                latents=inputs["latents"],
+                timestep=timestep,
+                context=inputs["context"],
+                y=inputs.get("y"),
+                use_gradient_checkpointing=inputs.get("use_gradient_checkpointing", False),
+                use_gradient_checkpointing_offload=inputs.get("use_gradient_checkpointing_offload", False),
+                audio_emb=inputs.get("audio_emb"),
+            )
+        else:
+            noise_pred = self.model_fn(**inputs, timestep=timestep)
         
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.scheduler.training_weight(timestep)
@@ -1294,6 +1313,136 @@ def model_fn_wan_video(
     if reference_latents is not None:
         x = x[:, reference_latents.shape[1]:]
         f -= 1
+    x = dit.unpatchify(x, (f, h, w))
+    return x
+
+
+def _ensure_omni_audio_modules(dit: WanModel, audio_hidden_size: int = 32):
+    """Lazy-init OmniAvatar-style audio modules on a WanModel instance.
+    - AudioPack projects concatenated wav2vec features with temporal patching (t=4)
+    - Per-layer linear projections map audio hidden to model dim for early blocks
+    """
+    if not hasattr(dit, "audio_proj") or dit.audio_proj is None:
+        dit.audio_proj = AudioPack(in_channels=10752, patch_size=(4, 1, 1), dim=audio_hidden_size, layernorm=True)
+    if not hasattr(dit, "audio_cond_projs") or dit.audio_cond_projs is None:
+        num_layers = len(dit.blocks)
+        num_inject = max(num_layers // 2 - 1, 0)
+        dit.audio_cond_projs = torch.nn.ModuleList([
+            torch.nn.Linear(audio_hidden_size, dit.dim) for _ in range(num_inject)
+        ])
+    dit.use_audio = True
+
+
+def model_fn_audio(
+    dit: WanModel,
+    latents: torch.Tensor,
+    timestep: torch.Tensor,
+    context: torch.Tensor,
+    y: Optional[torch.Tensor] = None,
+    audio_emb: Optional[torch.Tensor] = None,
+    use_gradient_checkpointing: bool = False,
+    use_gradient_checkpointing_offload: bool = False,
+    **kwargs,
+):
+    """OmniAvatar-style audio conditioning with reference y, ignoring clip_feature.
+    Expects `audio_emb` shaped [B, L, 10752] (or [L, 10752]).
+    Uses AudioPack(t=4) and injects per-layer early residuals before transformer blocks.
+    """
+    assert audio_emb is not None, "audio_emb must be provided for model_fn_audio."
+
+    # Timestep embedding
+    t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+    t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
+    # Text embedding
+    context = dit.text_embedding(context)
+
+    # Prepare input latents, fuse VAE image embedding y (no guards; relies on model being configured to 36 in-channels)
+    x = latents
+    if y is not None and dit.require_vae_embedding:
+        x = torch.cat([x, y], dim=1)
+
+    # Record latent grid for audio spatial expansion
+    lat_h, lat_w = latents.shape[-2], latents.shape[-1]
+
+    # Patchify
+    x, (f, h, w) = dit.patchify(x)
+
+    # RoPE freqs
+    freqs = torch.cat([
+        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+    # Prepare audio embeddings in OmniAvatar style
+    _ensure_omni_audio_modules(dit)
+    # Normalize shapes: [B, L, 10752]
+    if audio_emb.dim() == 2:
+        audio_emb = audio_emb.unsqueeze(0)
+    if audio_emb.shape[0] != x.shape[0]:
+        audio_emb = audio_emb[:1].repeat(x.shape[0], 1, 1)
+    audio_emb = audio_emb.to(device=x.device, dtype=x.dtype)
+    # [B, 10752, L, 1, 1]
+    audio_vid = audio_emb.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+    # Prepend 3 frames along time to align with latent packing
+    audio_vid = torch.cat([audio_vid[:, :, :1].repeat(1, 1, 3, 1, 1), audio_vid], dim=2)
+    # AudioPack -> [B, T', 1, 1, H]
+    audio_feat = dit.audio_proj(audio_vid)
+    # Per-layer projection stack -> cat along a pseudo layer batch dim
+    if len(dit.audio_cond_projs) > 0:
+        audio_proj_stack = torch.concat([proj(audio_feat) for proj in dit.audio_cond_projs], dim=0)
+        # Reshape to [B, LAYERS, T', 1, 1, dim]
+        audio_proj_stack = audio_proj_stack.reshape(
+            x.shape[0], audio_proj_stack.shape[0] // x.shape[0], audio_proj_stack.shape[1],
+            audio_proj_stack.shape[2], audio_proj_stack.shape[3], audio_proj_stack.shape[4]
+        )
+    else:
+        audio_proj_stack = None
+
+    # Grid size for token alignment (spatial tokens per frame)
+    tokens_h = max(lat_h // max(dit.patch_size[1], 1), 1)
+    tokens_w = max(lat_w // max(dit.patch_size[2], 1), 1)
+
+    def create_custom_forward(module):
+        def custom_forward(*inputs):
+            return module(*inputs)
+        return custom_forward
+
+    num_layers = len(dit.blocks)
+    for layer_i, block in enumerate(dit.blocks):
+        # Audio injection into early blocks (2..num_layers//2), before transformer block
+        if audio_proj_stack is not None and (layer_i <= num_layers // 2 and layer_i > 1):
+            au_idx = layer_i - 2
+            if 0 <= au_idx < audio_proj_stack.shape[1]:
+                a = audio_proj_stack[:, au_idx]  # [B, T', 1, 1, dim]
+                a = a.repeat(1, 1, tokens_h, tokens_w, 1)  # [B, T', H, W, dim]
+                a_tokens = a.view(a.shape[0], -1, a.shape[-1])  # [B, (T'*H*W), dim]
+                # Align lengths if necessary
+                if a_tokens.shape[1] < x.shape[1]:
+                    pad = x.shape[1] - a_tokens.shape[1]
+                    a_tokens = torch.cat([a_tokens, torch.zeros(a_tokens.shape[0], pad, a_tokens.shape[2], device=a_tokens.device, dtype=a_tokens.dtype)], dim=1)
+                elif a_tokens.shape[1] > x.shape[1]:
+                    a_tokens = a_tokens[:, :x.shape[1]]
+                x = a_tokens + x
+
+        if use_gradient_checkpointing_offload:
+            with torch.autograd.graph.save_on_cpu():
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    x, context, t_mod, freqs,
+                    use_reentrant=False,
+                )
+        elif use_gradient_checkpointing:
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(block),
+                x, context, t_mod, freqs,
+                use_reentrant=False,
+            )
+        else:
+            x = block(x, context, t_mod, freqs)
+
+    # Head and unpatchify
+    x = dit.head(x, t)
     x = dit.unpatchify(x, (f, h, w))
     return x
 
